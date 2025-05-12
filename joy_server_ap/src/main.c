@@ -186,80 +186,215 @@ const char *get_wind_rose_direction(float x, float y)
     return "CENTRO";
 }
 
-/**
- * @brief TCP callback: Handles received client data and sends HTML response.
- * @param arg Pointer to SENSOR_DATA_T.
- * @param tpcb TCP Protocol Control Block.
- * @param p Received pbuf chain (NULL if connection closed).
- * @param err Error code.
- * @return err_t ERR_OK on success.
- */
-static err_t tcp_server_recv_fn(void *arg, struct tcp_pcb *tpcb,
-                                struct pbuf *p, err_t err)
+int test_server_content(char *request, char *params, char *result, size_t result_size)
 {
-    SENSOR_DATA_T *readings = (SENSOR_DATA_T *)arg;
+    printf("======================================================");
+    printf(request);
+    printf("======================================================");
 
-    if (!p)
-    { // Client closed connection
-        tcp_recv(tpcb, NULL);
-        tcp_close(tpcb);
-        printf("P está vazio (conexão fechada pelo cliente ou erro)\n"); // Original log
-        return ERR_OK;
-    }
-
-    // Assumes any received data is an HTTP GET request.
-    // The request content itself is not parsed here.
-    // `request` buffer is allocated but its content not used for response logic.
-    char *request = (char *)malloc(p->tot_len + 1);
-    pbuf_copy_partial(p, request, p->tot_len, 0);
-    request[p->tot_len] = '\0';
-    // Original code does not use 'request' content.
-    // printf("Request: %s\n", request); // Optional: log request
-
-    // Temperature reading for HTML is from `readings->temperature`
-    // `read_internal_temperature()` call here is redundant if `update_readings` is current.
-    // float internal_temp = read_internal_temperature(); // This value is not used in snprintf.
-
-    char headers[256];
-    char body[4092]; // Buffer for HTML body
-
-    snprintf(body, sizeof(body),
-             "<!DOCTYPE html><html><head><meta charset=\"UTF-8\"><meta http-equiv=\"refresh\" content=\"1\"><title>Pico W - Status</title>"
-             "<style>body{background:#1a1a1a;color:#00ff00;font-family:monospace;display:flex;justify-content:center;align-items:center;height:100vh;margin:0;}"
-             ".box{border:2px solid #00ff00;padding:20px;text-align:center;min-width:300px;min-height:200px;}"
-             "h1{font-size:24px;margin-bottom:10px;}p{margin:5px 0;font-size:16px;}</style></head>"
-             "<body><div class=\"box\"><h1>PicoW Status</h1>"
-             "<p>Joystick X: %.2f</p><p>Joystick Y: %.2f</p>"
-             "<p>Botão A: %d</p><p>Botão B: %d</p>"
-             "<p>Temperatura: %.2f °C</p>"
-             "<p>Direção: <strong>%s</strong></p>"
-             "</div></body></html>",
-             readings->analog_x, readings->analog_y,
-             readings->button_a, readings->button_b,
-             readings->temperature, // Uses the value from SENSOR_DATA_T
-             get_wind_rose_direction(readings->analog_x, readings->analog_y));
-
-    int content_length = strlen(body);
-    snprintf(headers, sizeof(headers),
-             "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: %d\r\nConnection: close\r\n\r\n",
-             content_length);
-
-    char html[sizeof(headers) + sizeof(body)]; // Ensure buffer is large enough
-    snprintf(html, sizeof(html), "%s%s", headers, body);
-
-    tcp_write(tpcb, html, strlen(html), TCP_WRITE_FLAG_COPY);
-    err_t error = tcp_output(tpcb);
-    if (error != ERR_OK)
+    // A única rota que o servidor lida é "/"
+    if (strncmp(request, "/sensors", sizeof("/sensors") - 1) == 0)
     {
-        printf("Erro no TCP OUTPUT: %d\n", error); // Original log
+        const char *html_content = "<html><body><h1>Servidor funcionando!</h1></body></html>";
+        int len = strlen(html_content);
+        if (len < result_size)
+        {
+            strncpy(result, html_content, result_size);
+        }
+        return len; // Retorna o tamanho do conteúdo gerado
+    }
+    else
+    {
+        // Resposta para URL não encontrada (fallback)
+        const char *not_found_content = "<html><body><h1>404 Não encontrado</h1></body></html>";
+        int len = strlen(not_found_content);
+        if (len < result_size)
+        {
+            strncpy(result, not_found_content, result_size);
+        }
+        return len; // Retorna o tamanho do conteúdo gerado
+    }
+}
+
+static err_t tcp_close_client_connection(void *arg, struct tcp_pcb *client_pcb, err_t close_err)
+{
+    if (client_pcb)
+    {
+        assert(con_state && con_state->pcb == client_pcb);
+        tcp_arg(client_pcb, NULL);
+        tcp_poll(client_pcb, NULL, 0);
+        tcp_sent(client_pcb, NULL);
+        tcp_recv(client_pcb, NULL);
+        tcp_err(client_pcb, NULL);
+        err_t err = tcp_close(client_pcb);
+        if (err != ERR_OK)
+        {
+            printf("close failed %d, calling abort\n", err);
+            tcp_abort(client_pcb);
+            close_err = ERR_ABRT;
+        }
+    }
+    return close_err;
+}
+
+err_t tcp_server_recv_fn(void *arg, struct tcp_pcb *pcb, struct pbuf *p, err_t err)
+{
+    printf("TCP RECIEVE!");
+    // 1. Se não houver dados, a conexão foi fechada pelo cliente
+    if (!p)
+    {
+        // Realiza o encerramento da conexão TCP com o cliente
+        err_t close_err = tcp_close(pcb); // Envia o pacote de fim (TCP FIN)
+        if (close_err != ERR_OK)
+        {
+            printf("Failed to close TCP connection: %d\n", close_err);
+            return close_err; // Caso falhe ao fechar, retorna o erro
+        }
+
+        // Libera a memória associada à conexão
+        tcp_arg(pcb, NULL); // Remove os dados do argumento associado à conexão
+
+        // Fecha o controle de protocolos de camada de conexão
+        // Remover a conexão do PCB (Process Control Block)
+        return ERR_OK; // Retorna OK se tudo foi realizado corretamente
     }
 
-    free(request);
+    // 2. Garante que o ponteiro de conexão está válido
+    assert(pcb && arg);
+
+    // 3. Só processa se houver dados recebidos
+    if (p->tot_len > 0)
+    {
+        printf("tcp_server_recv %d bytes err %d\n", p->tot_len, err);
+
+        // 4. Define buffers para armazenar os dados de headers e corpo
+        char headers[512];
+        char result[1024];
+        int header_len = 0;
+        int result_len = 0;
+        int sent_len = 0;
+
+        // 5. Copia os dados recebidos para o buffer de headers
+        size_t max_copy = sizeof(headers) - 1;
+        pbuf_copy_partial(p, headers, p->tot_len > max_copy ? max_copy : p->tot_len, 0);
+        headers[max_copy] = '\0'; // Garantir terminação
+
+        // 6. Verifica se é uma requisição GET
+        if (strncmp("GET ", headers, 4) == 0)
+        {
+            char *request = headers + 4;
+            char *params = strchr(request, '?');
+
+            if (params && *params)
+            {
+                char *space = strchr(request, ' ');
+                *params++ = 0; // Termina a string da URI
+                if (space)
+                    *space = 0; // Remove o resto após os parâmetros
+            }
+            else
+            {
+                params = NULL;
+            }
+
+            // 7. Gera o conteúdo de resposta no buffer result
+            result_len = test_server_content(request, params, result, sizeof(result));
+            printf("Request: %s?%s\n", request, params);
+            printf("Result length: %d\n", result_len);
+
+            if (result_len > sizeof(result) - 1)
+            {
+                printf("Result buffer overflow (%d bytes)\n", result_len);
+                // return tcp_close_client_connection(pcb, ERR_CLSD);
+            }
+
+            // 8. Gera o cabeçalho HTTP adequado
+            if (result_len > 0)
+            {
+                header_len = snprintf(
+                    headers,
+                    sizeof(headers),
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\nContent-Length: %d\r\n\r\n",
+                    result_len);
+            }
+            else
+            {
+                // Redirecionamento se sem conteúdo
+                header_len = snprintf(
+                    headers,
+                    sizeof(headers),
+                    "HTTP/1.1 302 Found\r\nLocation: http://%s\r\n\r\n/sensors",
+                    ipaddr_ntoa(&pcb->local_ip));
+                printf("Redirecting to %s\n", ipaddr_ntoa(&pcb->local_ip));
+            }
+
+            if (header_len > sizeof(headers) - 1)
+            {
+                printf("Header buffer overflow (%d bytes)\n", header_len);
+                // Realiza o encerramento da conexão TCP com o cliente
+                err_t close_err = tcp_close(pcb); // Envia o pacote de fim (TCP FIN)
+                if (close_err != ERR_OK)
+                {
+                    printf("Failed to close TCP connection: %d\n", close_err);
+                    return close_err; // Caso falhe ao fechar, retorna o erro
+                }
+
+                // Libera a memória associada à conexão
+                tcp_arg(pcb, NULL); // Remove os dados do argumento associado à conexão
+
+                // Fecha o controle de protocolos de camada de conexão
+                return ERR_OK; // Retorna OK se tudo foi realizado corretamente
+            }
+
+            // 9. Envia cabeçalhos
+            err_t e = tcp_write(pcb, headers, header_len, TCP_WRITE_FLAG_COPY);
+            if (e != ERR_OK)
+            {
+                printf("Failed to write headers: %d\n", e);
+                // Realiza o encerramento da conexão TCP com o cliente
+                err_t close_err = tcp_close(pcb); // Envia o pacote de fim (TCP FIN)
+                if (close_err != ERR_OK)
+                {
+                    printf("Failed to close TCP connection: %d\n", close_err);
+                    return close_err; // Caso falhe ao fechar, retorna o erro
+                }
+
+                // Libera a memória associada à conexão
+                tcp_arg(pcb, NULL); // Remove os dados do argumento associado à conexão
+
+                return ERR_OK; // Retorna OK se tudo foi realizado corretamente
+            }
+
+            // 10. Envia corpo, se existir
+            if (result_len > 0)
+            {
+                e = tcp_write(pcb, result, result_len, TCP_WRITE_FLAG_COPY);
+                if (e != ERR_OK)
+                {
+                    printf("Failed to write body: %d\n", e);
+                    // return tcp_close_client_connection(pcb, e);
+                }
+            }
+        }
+
+        // 11. Notifica o lwIP de que os dados foram processados
+        tcp_recved(pcb, p->tot_len);
+    }
+
+    // 12. Libera o buffer da requisição
     pbuf_free(p);
+    return ERR_OK;
+}
 
-    // Set sent callback to close connection after data is acknowledged
-    tcp_sent(tpcb, tcp_sent_callback);
+static err_t tcp_server_poll(void *arg, struct tcp_pcb *pcb)
+{
+    printf("tcp_server_poll_fn\n");
+    return tcp_close_client_connection(NULL, pcb, ERR_OK); // Just disconnect clent?
+}
 
+static err_t tcp_server_sent(void *arg, struct tcp_pcb *pcb, u16_t len)
+{
+    printf("tcp_server_sent %u\n", len);
     return ERR_OK;
 }
 
@@ -279,6 +414,8 @@ static err_t tcp_server_accept_callback(void *arg, struct tcp_pcb *new_pcb, err_
     }
     tcp_arg(new_pcb, arg);
     tcp_recv(new_pcb, tcp_server_recv_fn);
+    tcp_poll(new_pcb, tcp_server_poll, 10);
+    tcp_sent(new_pcb, tcp_server_sent);
     return ERR_OK;
 }
 
@@ -295,7 +432,7 @@ void init_tcp_server(void *tcp_var)
         return;
     }
 
-    err_t err = tcp_bind(pcb, IP_ANY_TYPE, TCP_PORT); // Bind to any IP on TCP_PORT
+    err_t err = tcp_bind(pcb, IP_ADDR_ANY, TCP_PORT); // Bind to any IP on TCP_PORT
     if (err != ERR_OK)
     {                                                               // Check `err` not `pcb` for bind error
         printf("Não foi possível dar bind na porta 80: %d\n", err); // Original log
@@ -303,7 +440,7 @@ void init_tcp_server(void *tcp_var)
         return;
     }
 
-    server_pcb = tcp_listen(pcb); // Start listening (uses default backlog)
+    server_pcb = tcp_listen_with_backlog(pcb, 1); // Start listening (uses default backlog)
     if (!server_pcb)
     {
         printf("Não foi possível escutar na porta 80 (tcp_listen falhou)\n");
@@ -340,23 +477,25 @@ void init_buttons()
     gpio_pull_up(BTB);
 }
 
+ip4_addr_t gw_ip;
+ip4_addr_t mask;
+
 /**
  * @brief Main setup function: initializes stdio, drivers, and hardware.
  */
 void setup()
 {
     stdio_init_all();
-    init_display();     // Assumes drivers/display.h
-    init_wifi_sta();    // Assumes drivers/wifi.h
-    connect_to_wifi();  // Assumes drivers/wifi.h
-    init_temp_sensor(); // Assumes drivers/temp.h
-
+    init_display();
+    init_wifi_ap();
+    init_temp_sensor();
     adc_init();                        // General ADC init
     adc_set_temp_sensor_enabled(true); // Enable internal temperature sensor (ADC4)
-
     init_buttons();
     setup_joystick(); // Initializes ADC for joystick
-    // setup_pwm(); // Call if PWM LEDs are actively used
+    setup_pwm();
+
+    sleep_ms(1000);
 }
 
 /**
@@ -368,7 +507,7 @@ void show_connection_status()
 {
     show("-=-REDE-=-=", false);
     show(WIFI_SSID, false);
-    show(WIFI_PASSWORD, false); // Caution: Displaying password
+    show(WIFI_PASSWORD, false);
     char ip_msg[50];
     if (netif_default)
     { // Check if netif_default is valid
@@ -417,12 +556,11 @@ int main()
         printf("Falha ao alocar SENSOR_DATA_T\n");
         return 1;
     }
-    init_tcp_server(readings);
+
+    // init_tcp_server(readings);
 
     while (true)
     {
-        cyw43_arch_poll(); // Essential for lwIP and Wi-Fi event processing
-
         if (netif_default && netif_is_up(netif_default) && netif_is_link_up(netif_default))
         { // Check network status
             update_readings(readings);
@@ -433,6 +571,6 @@ int main()
     }
 
     free(readings);
-    deinit_wifi(); // Cleanup (though loop is infinite)
+    deinit_wifi();
     return 0;
 }
